@@ -1,7 +1,10 @@
 """Shared plotting primitives — one implementation each, reused by subject- and group-level figures."""
 
 import matplotlib.pyplot as plt
+import numpy as np
 import seaborn as sns
+from nilearn.image import load_img, new_img_like
+from nilearn.plotting import find_xyz_cut_coords, plot_stat_map
 from sklearn.metrics import confusion_matrix
 
 from _constants import CHANCE
@@ -102,6 +105,156 @@ def plot_subject_accuracy(df_subject_long, pairwise_stats, subject, output_path)
     ax.set_ylabel("Decoding accuracy")
     ax.set_xlabel("")
     ax.legend()
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_weight_map_comparison(weight_map_paths, bg_img, output_path, title=None):
+    """SVM weight maps on the subject's T1w, one panel per strategy, for one condition.
+
+    `weight_map_paths` : dict {strategy: path}, from decode.save_weight_maps()
+    output. `bg_img` : the subject's native-space T1w (see glm.find_t1w), same
+    space the weight maps were written into.
+
+    Uses nilearn's transparency thresholding (see
+    https://nilearn.github.io/stable/auto_examples/01_plotting/plot_transparency.html)
+    instead of a hard `threshold=` cutoff: opacity fades from 0 at the median
+    nonzero |weight| (pooled across strategies) up to full opacity at the 99th
+    percentile, so weak, likely-noisy voxels sink into the anatomy instead of
+    popping out at the same color as strong ones. The fade range, color scale,
+    and cut coordinates (picked from whichever strategy has the strongest
+    voxel, so every panel is sliced through the same anatomical location) are
+    all shared across strategies so panels are directly comparable.
+    """
+    imgs = {strategy: load_img(path) for strategy, path in weight_map_paths.items()}
+    all_abs = np.concatenate([np.abs(img.get_fdata()).ravel() for img in imgs.values()])
+    vmin_alpha, vmax = np.percentile(all_abs[all_abs > 0], [50, 99])
+
+    combined = new_img_like(
+        next(iter(imgs.values())),
+        np.max([np.abs(img.get_fdata()) for img in imgs.values()], axis=0),
+    )
+    cut_coords = find_xyz_cut_coords(combined)
+
+    fig, axes = plt.subplots(len(imgs), 1, figsize=(6, 4 * len(imgs)))
+    axes = np.atleast_1d(axes)
+    for ax, (strategy, img) in zip(axes, imgs.items()):
+        plot_stat_map(
+            img,
+            bg_img=bg_img,
+            cut_coords=cut_coords,
+            transparency=img,
+            transparency_range=[vmin_alpha, vmax],
+            vmax=vmax,
+            cmap="cold_hot",
+            axes=ax,
+            title=strategy,
+            colorbar=True,
+        )
+    if title:
+        fig.suptitle(title)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_grid_heatmap(
+    df_grid_summary, strategies, output_path, reference_strategy=None
+):
+    """Mean accuracy over (k, p), one heatmap panel per strategy, plus a
+    difference panel when `reference_strategy` is given and there are
+    exactly 2 strategies. Sign convention: `gap = other - reference` (matches
+    `analysis_results/README.md`'s existing `denoised - fmriprep` convention).
+
+    Magnitude panels share one sequential colormap + color scale (accuracy is
+    the same kind of quantity everywhere); the difference panel gets its own
+    diverging colormap centered at zero, since a gap can be positive or
+    negative.
+    """
+    show_diff = reference_strategy is not None and len(strategies) == 2
+    n_panels = len(strategies) + (1 if show_diff else 0)
+    fig, axes = plt.subplots(1, n_panels, figsize=(5 * n_panels, 4.5), squeeze=False)
+    axes = axes[0]
+
+    ks = sorted(df_grid_summary["k"].unique())
+    ps = sorted(df_grid_summary["p"].unique())
+    pivots = {
+        strategy: df_grid_summary[df_grid_summary["strategy"] == strategy]
+        .pivot(index="k", columns="p", values="mean")
+        .reindex(index=ks, columns=ps)
+        for strategy in strategies
+    }
+    vmin = min(p.min().min() for p in pivots.values())
+    vmax = max(p.max().max() for p in pivots.values())
+
+    for ax, strategy in zip(axes, strategies):
+        sns.heatmap(
+            pivots[strategy],
+            annot=True,
+            fmt=".3f",
+            cmap="viridis",
+            vmin=vmin,
+            vmax=vmax,
+            ax=ax,
+            cbar=True,
+        )
+        ax.set_title(strategy)
+        ax.set_xlabel("p (runs held out)")
+        ax.set_ylabel("k (ANOVA features)")
+
+    if show_diff:
+        other = next(s for s in strategies if s != reference_strategy)
+        gap = pivots[other] - pivots[reference_strategy]
+        gap_abs_max = float(np.abs(gap.to_numpy()).max())
+        sns.heatmap(
+            gap,
+            annot=True,
+            fmt=".3f",
+            cmap="RdBu_r",
+            vmin=-gap_abs_max,
+            vmax=gap_abs_max,
+            center=0,
+            ax=axes[-1],
+            cbar=True,
+        )
+        axes[-1].set_title(f"gap ({other} - {reference_strategy})")
+        axes[-1].set_xlabel("p (runs held out)")
+        axes[-1].set_ylabel("k (ANOVA features)")
+
+    fig.tight_layout()
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def plot_grid_lines(df_grid_summary, strategies, output_path):
+    """Secondary grid view: accuracy vs k (log scale), one line per p, faceted
+    by strategy. p is ordinal (fewer held-out runs = more training data), so
+    lines are colored along a single sequential ramp rather than arbitrary
+    categorical hues."""
+    ps = sorted(df_grid_summary["p"].unique())
+    colors = plt.cm.viridis(np.linspace(0, 1, len(ps)))
+
+    fig, axes = plt.subplots(
+        1, len(strategies), figsize=(5 * len(strategies), 4.5), sharey=True
+    )
+    axes = np.atleast_1d(axes)
+    for ax, strategy in zip(axes, strategies):
+        sub = df_grid_summary[df_grid_summary["strategy"] == strategy]
+        for p, color in zip(ps, colors):
+            line = sub[sub["p"] == p].sort_values("k")
+            ax.errorbar(
+                line["k"],
+                line["mean"],
+                yerr=line["sem"],
+                marker="o",
+                color=color,
+                label=f"p={p}",
+            )
+        ax.set_xscale("log")
+        ax.set_xlabel("k (ANOVA features)")
+        ax.set_title(strategy)
+    axes[0].set_ylabel("Mean decoding accuracy")
+    axes[-1].legend(title="p (runs held out)")
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
     plt.close(fig)
