@@ -1,0 +1,24 @@
+[project]
+name = "ibc-rsvp-denoising"
+version = "0.1.0"
+description = "Comparing fMRIPrep-only, fMRIPrep+Denoising, and Denoising+fMRIPrep strategies for brain decoding on the IBC RSVP language task."
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+    "patch-denoise[gpu]",
+    "matplotlib",
+    "nilearn",
+    "nibabel",
+    "cyclopts>=4.25.2",
+    "torch",
+    "pandas",
+    "scikit-learn",
+    "scipy",
+    "joblib",
+    "tqdm",
+    "statsmodels",
+    "seaborn",
+]
+
+[tool.uv.sources]
+patch-denoise = { path = "/home/pc280686/gits/nsp/patch-denoising", editable = true }
