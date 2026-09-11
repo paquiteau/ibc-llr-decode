@@ -72,6 +72,17 @@ def weight_map_for_label(decode_root, strategy, sub_label, label, tag="decode", 
     return index_img(img_4d, labels.index(label))
 
 
+def norm_map_path(
+    decode_root, strategy, sub_label, tag="decode", k=1500, kind="weight"
+):
+    """Path to the per-subject voxel-importance map (norm across classes),
+    written by decode.save_norm_map() as `<kind>_map_norm.nii.gz`."""
+    return (
+        _condition_dir(decode_root, strategy, sub_label, tag, k)
+        / f"{kind}_map_norm.nii.gz"
+    )
+
+
 def load_group_size_scores(decode_root, strategy, sub_label, p, tag="cv_sweep", k=1500):
     """Read scores_p<p>.npy written by decode.save_group_size_comparison()."""
     condition_dir = _condition_dir(decode_root, strategy, sub_label, tag, k)
@@ -234,7 +245,9 @@ def pairwise_contrasts_from_lmm(lmm_result, strategies, reference):
     return pd.DataFrame(rows)
 
 
-def hierarchical_bootstrap_contrast(df_long, strategy_a, strategy_b, n_boot=5000, seed=0):
+def hierarchical_bootstrap_contrast(
+    df_long, strategy_a, strategy_b, n_boot=5000, seed=0
+):
     """Two-stage (subject, then fold) bootstrap for the strategy_b - strategy_a
     group difference on the fold-level data — a nonparametric counterpart to
     `fit_group_lmm` that needs no REML convergence, useful as a check when the

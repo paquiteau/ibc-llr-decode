@@ -10,6 +10,7 @@ import joblib
 import nibabel as nib
 import numpy as np
 from joblib import Parallel, delayed
+from nilearn.image import concat_imgs, math_img
 from nilearn.interfaces.bids import parse_bids_filename
 from nilearn.maskers import NiftiMasker
 from sklearn.base import clone
@@ -74,6 +75,17 @@ def _load_cached(cache_path):
             return data["X"], data["y"], data["g"]
     except Exception:
         return None
+
+
+def load_cached_glm_data(cache_dir, derivatives_folder, sub_label):
+    """Return cached (X, y, g) for one subject, written by `load_glm_data`, or None.
+
+    Lets a backfill (e.g. adding Haufe pattern maps to an existing `decode`
+    run) reuse the already-parsed beta/z-score arrays without touching the
+    source NIfTIs, as long as that subject/strategy was previously loaded
+    with a matching `cache_dir`.
+    """
+    return _load_cached(_cache_path(cache_dir, derivatives_folder, sub_label))
 
 
 def _save_cache_atomic(cache_path, X, y, g):
@@ -433,21 +445,78 @@ def average_weight_maps(models, masker):
     return weight_maps
 
 
-def save_weight_maps(output_dir, sub_label, tag, k, weight_maps):
-    """Save all classes' weight maps as one 4D NIfTI + a label sidecar.
+def average_pattern_maps(models, X, g, masker):
+    """Haufe-transformed activation patterns, averaged across CV folds.
 
-    `weight_maps` : dict {class_label: 3D Nifti1Image}, from average_weight_maps().
-    Written as `weight_maps.nii.gz` (volume order = alphabetical label order)
-    plus `weight_maps_labels.json` (that same label list) — one 4D file instead
-    of one per class is simpler to keep track of, and NiftiMasker.inverse_transform()'s
-    output only carries an sform (qform_code left at 0), which some viewers
-    ignore when overlaying onto another image (e.g. the T1w) that has both set
-    — so both are set explicitly here to the same affine.
+    Raw SVM weights (`average_weight_maps`) can give a voxel a large weight
+    purely to cancel noise correlated with the true signal in other voxels —
+    they tell you what the classifier relies on, not where the discriminative
+    signal actually lives. Activation patterns (Haufe et al., 2014,
+    NeuroImage) fix this by measuring how each voxel covaries with the
+    classifier's decision variable instead: A = Cov(X) @ W. Computed here per
+    fold as A_j = Cov(x_j, s), with s = X_support @ w, on that fold's
+    training trials (the same trials the weight vector was fit on) — this is
+    algebraically equivalent to the full Cov(X) @ W but avoids ever forming
+    the (n_selected x n_selected) covariance matrix.
+
+    `X`, `g` must be the same arrays passed to `run_decoding` — fold order
+    is recovered by replaying the same LeaveOneGroupOut split.
+
+    Returns dict {class_label: nibabel Nifti1Image}, same shape as
+    `average_weight_maps`.
+    """
+    models = [
+        est.best_estimator_ if hasattr(est, "best_estimator_") else est
+        for est in models
+    ]
+    outer_splits = list(LeaveOneGroupOut().split(X, groups=g))
+    classes = models[0].classes_
+    n_features = len(models[0].estimators_[0].named_steps["anova"].get_support())
+
+    pattern_maps = {}
+    for class_idx, label in enumerate(classes):
+        acc = np.zeros(n_features)
+        for model, (train_idx, _) in zip(models, outer_splits):
+            est = model.estimators_[class_idx]
+            support = est.named_steps["anova"].get_support()
+            w = est.named_steps["svc"].coef_.ravel()
+            X_support = X[train_idx][:, support]
+            s = X_support @ w
+            Xc = X_support - X_support.mean(axis=0)
+            sc = s - s.mean()
+            acc[support] += Xc.T @ sc / (len(sc) - 1)
+        pattern_maps[label] = masker.inverse_transform(acc / len(models))
+    return pattern_maps
+
+
+def collapse_norm_map(maps):
+    """L2 norm across classes: one "how important is this voxel" map per subject.
+
+    `maps` : dict {class_label: 3D Nifti1Image}, from `average_weight_maps`
+    or `average_pattern_maps`.
+    """
+    labels = sorted(maps)
+    stacked = concat_imgs([maps[label] for label in labels])
+    return math_img("np.linalg.norm(img, axis=-1)", img=stacked)
+
+
+def save_weight_maps(output_dir, sub_label, tag, k, weight_maps, kind="weight"):
+    """Save all classes' weight/pattern maps as one 4D NIfTI + a label sidecar.
+
+    `weight_maps` : dict {class_label: 3D Nifti1Image}, from
+    `average_weight_maps()` (kind="weight") or `average_pattern_maps()`
+    (kind="pattern"). Written as `<kind>_maps.nii.gz` (volume order =
+    alphabetical label order) plus `<kind>_maps_labels.json` (that same label
+    list) — one 4D file instead of one per class is simpler to keep track of,
+    and NiftiMasker.inverse_transform()'s output only carries an sform
+    (qform_code left at 0), which some viewers ignore when overlaying onto
+    another image (e.g. the T1w) that has both set — so both are set
+    explicitly here to the same affine.
     """
     condition = f"test_anova_{k}"
     out = Path(output_dir) / f"sub-{sub_label}" / tag / condition
     out.mkdir(parents=True, exist_ok=True)
-    for stale in out.glob("weight_map_*.nii.gz"):
+    for stale in out.glob(f"{kind}_map_*.nii.gz"):
         stale.unlink()
 
     labels = sorted(weight_maps)
@@ -456,6 +525,15 @@ def save_weight_maps(output_dir, sub_label, tag, k, weight_maps):
     img_4d = nib.Nifti1Image(data_4d, affine)
     img_4d.set_sform(affine, code=2)
     img_4d.set_qform(affine, code=2)
-    img_4d.to_filename(out / "weight_maps.nii.gz")
-    (out / "weight_maps_labels.json").write_text(json.dumps(labels))
+    img_4d.to_filename(out / f"{kind}_maps.nii.gz")
+    (out / f"{kind}_maps_labels.json").write_text(json.dumps(labels))
+    return out
+
+
+def save_norm_map(output_dir, sub_label, tag, k, norm_img, kind="weight"):
+    """Save a norm-collapsed map (see `collapse_norm_map`) as `<kind>_map_norm.nii.gz`."""
+    condition = f"test_anova_{k}"
+    out = Path(output_dir) / f"sub-{sub_label}" / tag / condition
+    out.mkdir(parents=True, exist_ok=True)
+    norm_img.to_filename(out / f"{kind}_map_norm.nii.gz")
     return out

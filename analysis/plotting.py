@@ -128,14 +128,7 @@ def plot_weight_map_comparison(weight_map_paths, bg_img, output_path, title=None
     all shared across strategies so panels are directly comparable.
     """
     imgs = {strategy: load_img(path) for strategy, path in weight_map_paths.items()}
-    all_abs = np.concatenate([np.abs(img.get_fdata()).ravel() for img in imgs.values()])
-    vmin_alpha, vmax = np.percentile(all_abs[all_abs > 0], [50, 99])
-
-    combined = new_img_like(
-        next(iter(imgs.values())),
-        np.max([np.abs(img.get_fdata()) for img in imgs.values()], axis=0),
-    )
-    cut_coords = find_xyz_cut_coords(combined)
+    vmin_alpha, vmax, cut_coords = _fade_range_and_cut_coords(imgs)
 
     fig, axes = plt.subplots(len(imgs), 1, figsize=(6, 4 * len(imgs)))
     axes = np.atleast_1d(axes)
@@ -148,6 +141,60 @@ def plot_weight_map_comparison(weight_map_paths, bg_img, output_path, title=None
             transparency_range=[vmin_alpha, vmax],
             vmax=vmax,
             cmap="cold_hot",
+            axes=ax,
+            title=strategy,
+            colorbar=True,
+        )
+    if title:
+        fig.suptitle(title)
+    fig.savefig(output_path, dpi=150)
+    plt.close(fig)
+
+
+def _fade_range_and_cut_coords(imgs):
+    """Shared transparency-thresholding setup for weight/pattern/norm map figures.
+
+    `imgs` : dict {strategy: Nifti1Image}. Opacity fades from 0 at the median
+    nonzero |value| (pooled across strategies) up to full opacity at the 99th
+    percentile, and cut coordinates are picked from whichever strategy has the
+    strongest voxel — both shared across strategies so panels are directly
+    comparable (see plot_weight_map_comparison).
+    """
+    all_abs = np.concatenate([np.abs(img.get_fdata()).ravel() for img in imgs.values()])
+    vmin_alpha, vmax = np.percentile(all_abs[all_abs > 0], [50, 99])
+    combined = new_img_like(
+        next(iter(imgs.values())),
+        np.max([np.abs(img.get_fdata()) for img in imgs.values()], axis=0),
+    )
+    cut_coords = find_xyz_cut_coords(combined)
+    return vmin_alpha, vmax, cut_coords
+
+
+def plot_norm_map_comparison(norm_map_paths, bg_img, output_path, title=None):
+    """Per-subject voxel-importance maps (L2 norm across classes) on the T1w,
+    one panel per strategy.
+
+    `norm_map_paths` : dict {strategy: path}, from decode.save_norm_map()
+    output (see decode.collapse_norm_map — "how much does this voxel matter
+    for decoding"). Unlike raw signed weights, norms are one-sided, so this
+    uses a sequential colormap with vmin=0 instead of `plot_weight_map_comparison`'s
+    diverging one.
+    """
+    imgs = {strategy: load_img(path) for strategy, path in norm_map_paths.items()}
+    vmin_alpha, vmax, cut_coords = _fade_range_and_cut_coords(imgs)
+
+    fig, axes = plt.subplots(len(imgs), 1, figsize=(6, 4 * len(imgs)))
+    axes = np.atleast_1d(axes)
+    for ax, (strategy, img) in zip(axes, imgs.items()):
+        plot_stat_map(
+            img,
+            bg_img=bg_img,
+            cut_coords=cut_coords,
+            transparency=img,
+            transparency_range=[vmin_alpha, vmax],
+            vmin=0,
+            vmax=vmax,
+            cmap="hot",
             axes=ax,
             title=strategy,
             colorbar=True,

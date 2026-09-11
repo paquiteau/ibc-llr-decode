@@ -160,11 +160,14 @@ def decode(
     or k values — see `decode.load_glm_data`.
     """
     from decode import (
+        average_pattern_maps,
         average_weight_maps,
+        collapse_norm_map,
         compare_group_sizes,
         load_glm_data,
         run_decoding,
         save_group_size_comparison,
+        save_norm_map,
         save_results,
         save_weight_maps,
     )
@@ -203,7 +206,28 @@ def decode(
                 fold_sizes,
             )
             weight_maps = average_weight_maps(cv_results["estimator"], masker)
-            save_weight_maps(output_dir, sub_label, tag, k, weight_maps)
+            save_weight_maps(output_dir, sub_label, tag, k, weight_maps, kind="weight")
+            save_norm_map(
+                output_dir,
+                sub_label,
+                tag,
+                k,
+                collapse_norm_map(weight_maps),
+                kind="weight",
+            )
+
+            pattern_maps = average_pattern_maps(cv_results["estimator"], X, g, masker)
+            save_weight_maps(
+                output_dir, sub_label, tag, k, pattern_maps, kind="pattern"
+            )
+            save_norm_map(
+                output_dir,
+                sub_label,
+                tag,
+                k,
+                collapse_norm_map(pattern_maps),
+                kind="pattern",
+            )
         else:
             results, predictions = compare_group_sizes(
                 X,
@@ -226,17 +250,34 @@ def weight_maps(
     sub: list[str] | None = None,
     tag: str = "decode",
     k: int = 1500,
+    cache_dir: Path | None = None,
+    derivatives_folder: Path | None = None,
 ):
-    """Backfill/refresh weight_map_<condition>.nii.gz for an existing `decode --output-dir` tree.
+    """Backfill/refresh weight/pattern maps for an existing `decode --output-dir` tree.
 
     Loads the already-fitted svm_fold_*.pkl models saved by `decode` (no
     refitting, no GLM beta reload) and only rebuilds each subject's brain mask
     to map weights back to voxel space. Use this after upgrading `decode.py`
     to add weight maps to decode runs that predate that feature.
+
+    Pass matching `--cache-dir`/`--derivatives-folder` (the same values used
+    for that `decode` run) to also backfill Haufe activation-pattern maps
+    (`pattern_maps.nii.gz` + `pattern_map_norm.nii.gz`) from the cached
+    (X, g) arrays — still no refit, just `average_pattern_maps` on the
+    already-fitted models. Without them, only the raw-weight maps are
+    (re)written.
     """
     from nilearn.maskers import NiftiMasker
 
-    from decode import average_weight_maps, load_saved_models, save_weight_maps
+    from decode import (
+        average_pattern_maps,
+        average_weight_maps,
+        collapse_norm_map,
+        load_cached_glm_data,
+        load_saved_models,
+        save_norm_map,
+        save_weight_maps,
+    )
     from glm import find_brain_mask
 
     for sub_label in sub or SUBJECTS:
@@ -246,7 +287,29 @@ def weight_maps(
         masker = NiftiMasker(mask_img=mask_path).fit()
         models = load_saved_models(decode_dir, sub_label, tag, k)
         maps = average_weight_maps(models, masker)
-        save_weight_maps(decode_dir, sub_label, tag, k, maps)
+        save_weight_maps(decode_dir, sub_label, tag, k, maps, kind="weight")
+        save_norm_map(
+            decode_dir, sub_label, tag, k, collapse_norm_map(maps), kind="weight"
+        )
+
+        if cache_dir is not None and derivatives_folder is not None:
+            cached = load_cached_glm_data(cache_dir, derivatives_folder, sub_label)
+            if cached is None:
+                print(f"sub-{sub_label}: no cached GLM data, skipping pattern maps")
+                continue
+            X, _y, g = cached
+            pattern_maps = average_pattern_maps(models, X, g, masker)
+            save_weight_maps(
+                decode_dir, sub_label, tag, k, pattern_maps, kind="pattern"
+            )
+            save_norm_map(
+                decode_dir,
+                sub_label,
+                tag,
+                k,
+                collapse_norm_map(pattern_maps),
+                kind="pattern",
+            )
 
 
 @app.command()

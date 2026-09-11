@@ -21,6 +21,7 @@ from analysis.plotting import (
     plot_grid_heatmap,
     plot_grid_lines,
     plot_group_comparison,
+    plot_norm_map_comparison,
     plot_subject_accuracy,
     plot_weight_map_comparison,
     save_confusion_matrix,
@@ -32,6 +33,7 @@ from analysis.stats import (
     fit_group_lmm,
     grid_summary,
     load_predictions,
+    norm_map_path,
     pairwise_contrasts_from_lmm,
     subject_level_pairwise_ttests,
     weight_map_for_label,
@@ -113,6 +115,31 @@ def run_analysis(
                     bg_img,
                     sub_dir / f"weight_map_{label}.png",
                     title=f"sub-{sub_label} — {label}",
+                )
+
+        # Per-subject voxel-importance maps (norm across classes) — how much
+        # each voxel matters for decoding, independent of any one condition.
+        # Raw-weight norm can overweight noise-cancelling voxels (Haufe et
+        # al., 2014); the pattern-norm map is the activation-pattern
+        # counterpart. Guarded the same way as the per-condition weight maps.
+        for kind in ("weight", "pattern"):
+            have_norm_maps = all(
+                norm_map_path(decode_root, strategy, sub_label, tag, k, kind).exists()
+                for strategy in strategies
+            )
+            if have_norm_maps:
+                bg_img = find_t1w(dataset_dir, sub_label, mask_derivatives_folder)
+                paths = {
+                    strategy: norm_map_path(
+                        decode_root, strategy, sub_label, tag, k, kind
+                    )
+                    for strategy in strategies
+                }
+                plot_norm_map_comparison(
+                    paths,
+                    bg_img,
+                    sub_dir / f"{kind}_map_norm.png",
+                    title=f"sub-{sub_label} — {kind} norm",
                 )
 
     df_long = build_long_dataframe(decode_root, strategies, subjects, tag, k)
