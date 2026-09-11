@@ -126,10 +126,61 @@ Output:
 
 ```
 analysis_results/
-├── subjects/sub-XX/pairwise_ttests.csv, accuracy_boxplot.png, confusion_matrix_<strategy>.png
+├── subjects/sub-XX/pairwise_ttests.csv, accuracy_boxplot.png,
+│                    confusion_matrix_<strategy>.png, weight_map_<condition>.png
 └── group/lmm_summary.txt, pairwise_contrasts.csv, subject_level_pairwise_ttests.csv, group_comparison.png
 ```
 
+`weight_map_<condition>.png` compares, per subject and condition, the SVM's
+weight map (averaged over CV folds) across denoising strategies, overlaid on
+the subject's T1w with transparency thresholding. The underlying weights are
+written by `decode` as a single 4D `weight_maps.nii.gz` (one volume per
+condition, order given by the `weight_maps_labels.json` sidecar) alongside its
+other per-subject outputs.
+
+### Caching repeated GLM-data loads
+
+`decode`'s `--cache-dir <dir>` caches each subject's loaded beta/z-score
+arrays, keyed by derivatives folder + subject (independent of `k`,
+`--leave-p-out`, `--tag`) — useful when sweeping several `k` values for the
+same subject/strategy, since it skips re-parsing NIfTI files on a cache hit.
+Safe to share across concurrent `decode` invocations for different
+subjects/k values (e.g. a parallel job runner) — see `scripts/grid_search.sh`
+below. `X` is loaded as float32 (the source NIfTI's native precision; nilearn
+upcasts to float64 by default, adding no real precision but doubling memory
+and BLAS cost) — re-running an old decode after upgrading to this may shift
+`cvscores.npy` at floating-point-noise level versus a result computed before.
+
+### `k`/`p` grid search
+
+`grid-analysis` aggregates decode runs across several `k` (ANOVA feature
+count) and `p` (`--leave-p-out`, i.e. training-set size) values into one
+comparison — a different, more exploratory question than `analysis`'s
+"is strategy A better at one fixed k":
+
+```bash
+uv run python cli.py grid-analysis /volatile2/ibc_rsvp/decode_results \
+    /volatile2/ibc_rsvp/analysis_results_grid \
+    --strategy fmriprep --strategy fmriprep+denoised \
+    --k 1500 --k 3000 --k 10000 --k 20000 --k 50000 \
+    --p 1 --p 2 --p 3 --p 4 --p 5
+```
+
+It expects, per strategy and per `k`, both a `--tag decode` tree (p=1,
+read from there) and a `--tag cv_sweep` tree (`--leave-p-out 2 3 4 5` —
+never re-run p=1 there, it would just duplicate the main decode). Output:
+`grid_long.csv`/`grid_summary.csv` (mean/std/sem per (strategy, k, p)),
+`heatmap_accuracy.png` (accuracy over (k, p), one panel per strategy plus a
+`gap = other - reference` panel), `lines_accuracy_vs_k.png` (accuracy vs k,
+one line per p).
+
+`scripts/grid_search.sh` runs the many `decode` invocations a full grid
+needs as separate, bounded-concurrency processes (tunable via
+`MAX_CONCURRENT_JOBS`/`NJOBS_PER_JOB` env vars — budget their product
+against physical cores, not hyperthreads), skips any `(strategy, k, subject)`
+job whose output already exists, and calls `grid-analysis` once all jobs
+finish. Edit the `STRATEGIES`/`MAIN_KS`/`SWEEP_KS` arrays at the top to
+extend a sweep — already-done combinations skip instantly.
 
 ## Statistics methodology
 
@@ -138,11 +189,22 @@ analysis_results/
   comparison per subject. `n_train`/`n_test` are derived from the actual CV
   fold sizes recorded by `decode` (`fold_sizes.json`) — not a hardcoded
   constant.
-- **Group-level**: one linear mixed-effects model,
-  `accuracy ~ strategy` with subject as a random effect, fitted once. All 3
-  pairwise strategy contrasts are derived from that single fit (no repeated
-  re-fitting, no extra multiple-comparison correction needed since these are
-  contrasts of one model, not independent tests).
+- **Group-level**: one linear mixed-effects model, `accuracy ~ strategy`,
+  fitted once on the fold-level data (not subject means) with subject as a
+  random effect (intercept). A random slope on strategy was tried too, but
+  doesn't converge for this dataset's subject count — the slope variance
+  estimates to the parameter-space boundary — so the random-intercept model
+  is used. All 3 pairwise strategy contrasts are derived from that single fit
+  (no repeated re-fitting, no extra multiple-comparison correction needed
+  since these are contrasts of one model, not independent tests).
+- **Group-level, nonparametric check**: a hierarchical (subject-then-fold)
+  bootstrap on the same fold-level data — resample subjects with
+  replacement, then resample folds within each resampled subject with
+  replacement, recomputing the group contrast each replicate. Needs no REML
+  convergence, so it's a useful cross-check on the LMM p-values, especially
+  given the boundary-solution warning above. Written to
+  `group/bootstrap_pairwise_contrasts.csv` (`estimate`/`ci_low`/`ci_high`/
+  `p_value` per pair, sign convention `strategy_b - strategy_a`).
 
 ## Future work
 
