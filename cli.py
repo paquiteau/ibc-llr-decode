@@ -138,6 +138,7 @@ def decode(
     nested: bool = False,
     leave_p_out: list[int] | None = None,
     tag: str = "decode",
+    cache_dir: Path | None = None,
 ):
     """Fit a leave-p-run-out SVM decoder on LSS beta/z-score maps, per subject.
 
@@ -150,17 +151,26 @@ def decode(
     `--leave-p-out 1 --leave-p-out 2 --leave-p-out 3` — `save_group_size_comparison`
     overwrites a subject's whole sweep output each call, so invoking `decode`
     once per p value would silently discard all but the last one.
+
+    `cache_dir`, if given, caches each subject's loaded beta/z-score arrays
+    (keyed by derivatives folder + subject, independent of `k`/`leave_p_out`/
+    `tag`) so sweeping multiple `k` values for the same subject/strategy only
+    parses the underlying NIfTI files once. Safe to share across concurrent
+    `decode` invocations (e.g. a parallel job runner) for different subjects
+    or k values — see `decode.load_glm_data`.
     """
     from decode import (
+        average_weight_maps,
         compare_group_sizes,
         load_glm_data,
         run_decoding,
         save_group_size_comparison,
         save_results,
+        save_weight_maps,
     )
 
     for sub_label in sub or SUBJECTS:
-        X, y, g = load_glm_data(
+        X, y, g, masker = load_glm_data(
             dataset_dir,
             derivatives_folder,
             mask_derivatives_folder,
@@ -169,6 +179,7 @@ def decode(
             suffix=suffix,
             sub_labels=[sub_label],
             n_jobs=n_jobs,
+            cache_dir=cache_dir,
         )
         if not leave_p_out:
             cv_results, cv_predict, best_params_per_fold, fold_sizes = run_decoding(
@@ -191,6 +202,8 @@ def decode(
                 best_params_per_fold,
                 fold_sizes,
             )
+            weight_maps = average_weight_maps(cv_results["estimator"], masker)
+            save_weight_maps(output_dir, sub_label, tag, k, weight_maps)
         else:
             results, predictions = compare_group_sizes(
                 X,
@@ -206,9 +219,42 @@ def decode(
 
 
 @app.command()
+def weight_maps(
+    decode_dir: ExistingDirectory,
+    dataset_dir: ExistingDirectory,
+    mask_derivatives_folder: Path,
+    sub: list[str] | None = None,
+    tag: str = "decode",
+    k: int = 1500,
+):
+    """Backfill/refresh weight_map_<condition>.nii.gz for an existing `decode --output-dir` tree.
+
+    Loads the already-fitted svm_fold_*.pkl models saved by `decode` (no
+    refitting, no GLM beta reload) and only rebuilds each subject's brain mask
+    to map weights back to voxel space. Use this after upgrading `decode.py`
+    to add weight maps to decode runs that predate that feature.
+    """
+    from nilearn.maskers import NiftiMasker
+
+    from decode import average_weight_maps, load_saved_models, save_weight_maps
+    from glm import find_brain_mask
+
+    for sub_label in sub or SUBJECTS:
+        mask_path = find_brain_mask(
+            dataset_dir, sub_label, fmriprep_folder=mask_derivatives_folder
+        )
+        masker = NiftiMasker(mask_img=mask_path).fit()
+        models = load_saved_models(decode_dir, sub_label, tag, k)
+        maps = average_weight_maps(models, masker)
+        save_weight_maps(decode_dir, sub_label, tag, k, maps)
+
+
+@app.command()
 def analysis(
     decode_dir: ExistingDirectory,
     output_dir: Path,
+    dataset_dir: ExistingDirectory,
+    mask_derivatives_folder: Path,
     strategy: list[str] | None = None,
     sub: list[str] | None = None,
     tag: str = "decode",
@@ -219,16 +265,61 @@ def analysis(
 
     `decode_dir` must contain one subdirectory per strategy, each populated by
     a `decode --output-dir <decode_dir>/<strategy>` run (see README).
+
+    `dataset_dir`/`mask_derivatives_folder` locate each subject's T1w for the
+    weight-map figures — always the plain fMRIPrep derivatives (same
+    convention as `decode`'s `mask_derivatives_folder`).
     """
     from analysis import run_analysis
 
     run_analysis(
         decode_dir,
         output_dir,
+        dataset_dir,
+        mask_derivatives_folder,
         strategies=strategy or list(STRATEGIES),
         subjects=sub or SUBJECTS,
         tag=tag,
         k=k,
+        reference_strategy=reference_strategy,
+    )
+
+
+@app.command()
+def grid_analysis(
+    decode_dir: ExistingDirectory,
+    output_dir: Path,
+    strategy: list[str] | None = None,
+    sub: list[str] | None = None,
+    k: list[int] | None = None,
+    p: list[int] | None = None,
+    tag_main: str = "decode",
+    tag_sweep: str = "cv_sweep",
+    reference_strategy: str = "fmriprep",
+):
+    """Aggregate a (k, p) grid search into a long dataframe + heatmap/line figures.
+
+    `decode_dir` must contain, per strategy, both a `--tag decode` (k-only)
+    tree and a `--tag cv_sweep` (`--leave-p-out 2 3 4 ...`) tree at each `k`
+    (see `decode`'s docstring) — p=1 is read from the `decode` tree, never
+    from `cv_sweep` (a p=1 cv_sweep run would just duplicate the main decode).
+
+    Answers "which (k, p) region looks good" — a different, exploratory
+    question from `analysis`'s "is strategy A better at one fixed, chosen k".
+    Run this first to survey, then `analysis --k <chosen>` for the real
+    strategy comparison.
+    """
+    from analysis import run_grid_analysis
+
+    run_grid_analysis(
+        decode_dir,
+        output_dir,
+        strategies=strategy or ["fmriprep", "fmriprep+denoised"],
+        subjects=sub or SUBJECTS,
+        ks=k or [1500, 3000, 10000, 20000, 50000],
+        ps=p or [1, 2, 3, 4, 5],
+        tag_main=tag_main,
+        tag_sweep=tag_sweep,
         reference_strategy=reference_strategy,
     )
 

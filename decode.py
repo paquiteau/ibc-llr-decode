@@ -2,9 +2,12 @@
 
 import contextlib
 import json
+import os
+import tempfile
 from pathlib import Path
 
 import joblib
+import nibabel as nib
 import numpy as np
 from joblib import Parallel, delayed
 from nilearn.interfaces.bids import parse_bids_filename
@@ -43,11 +46,54 @@ def tqdm_joblib(tqdm_object):
         tqdm_object.close()
 
 
-def _load_one_file(file, mask):
-    beta_data = mask.transform(file)
+def _load_one_file(file, mask, dtype=np.float32):
+    # Downcast right after transform(): the source NIfTI is already float32
+    # on disk (its header dtype), so nilearn's get_fdata() float64 upcast
+    # inside mask.transform() adds no real precision — only doubles memory
+    # and the BLAS cost of every downstream ANOVA/SVM fit.
+    beta_data = mask.transform(file).astype(dtype, copy=False)
     entities = parse_bids_filename(file)["entities"]
     sub, cond, run = entities["sub"], entities["cond"], entities["run"]
     return [cond] * beta_data.shape[0], [f"{sub}-{run}"] * beta_data.shape[0], beta_data
+
+
+def _cache_path(cache_dir, derivatives_folder, sub_label):
+    return Path(cache_dir) / Path(derivatives_folder).name / f"sub-{sub_label}.npz"
+
+
+def _load_cached(cache_path):
+    """Return (X, y, g) from `cache_path`, or None on a miss/unreadable file.
+
+    Never raises — a corrupt or half-written cache file (e.g. from a crashed
+    process) just falls back to recomputing, same as a cold cache.
+    """
+    if not cache_path.exists():
+        return None
+    try:
+        with np.load(cache_path) as data:
+            return data["X"], data["y"], data["g"]
+    except Exception:
+        return None
+
+
+def _save_cache_atomic(cache_path, X, y, g):
+    """Write (X, y, g) to `cache_path` via a same-dir temp file + atomic rename.
+
+    Safe under concurrent writers targeting the same path (several parallel
+    jobs populating a cold cache for the same subject/strategy): os.replace
+    is an atomic rename on POSIX, so the loser's write is simply overwritten
+    — never a torn/partial file for whoever reads it next.
+    """
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=cache_path.parent, suffix=".npz.tmp")
+    os.close(fd)
+    try:
+        with open(tmp_name, "wb") as fh:
+            np.savez(fh, X=X, y=y, g=g)
+        os.replace(tmp_name, cache_path)
+    except BaseException:
+        os.unlink(tmp_name)
+        raise
 
 
 def load_glm_data(
@@ -59,11 +105,23 @@ def load_glm_data(
     glm_folder="glm",
     suffix="zscore",
     n_jobs=10,
+    cache_dir=None,
 ):
     """Load LSS GLM beta/z-score maps for one or more subjects.
 
-    Returns (X, y, groups): stacked beta/z-score arrays, condition labels, and
-    "<sub>-<run>" group labels (used for leave-run-out cross-validation).
+    Returns (X, y, groups, masker): stacked beta/z-score arrays (float32 — see
+    `_load_one_file`), condition labels, "<sub>-<run>" group labels (used for
+    leave-run-out cross-validation), and the fitted NiftiMasker — needed to
+    map SVM weight vectors back to brain space. The masker is only meaningful
+    when `sub_labels` has a single subject (the only way this is currently
+    called); with several subjects it is just the last one's mask.
+
+    `cache_dir`, if given, caches the loaded (X, y, g) per
+    `(Path(derivatives_folder).name, sub_label)` — independent of any
+    downstream k/p/tag — so repeated calls for the same subject/strategy
+    (e.g. sweeping k) skip re-parsing NIfTI files entirely. The masker itself
+    is not cached; rebuilding it is cheap. `None` (default) disables caching,
+    unchanged from prior behavior.
     """
     all_events, all_group_labels, all_beta_maps = [], [], []
 
@@ -73,37 +131,54 @@ def load_glm_data(
     search_root = Path(dataset_dir) / derivatives_folder
 
     for sub_label in sub_labels:
-        task_glob = f"*task-{task_label}*" if task_label else "*"
-        pattern = (
-            f"sub-{sub_label}/ses-*/{glm_folder}/"
-            f"sub-{sub_label}_ses-*{task_glob}_cond-*_{suffix}.nii.gz"
-        )
-        files = sorted(str(p) for p in search_root.glob(pattern))
-        if not files:
-            raise FileNotFoundError(
-                f"No files found for sub-{sub_label} in "
-                f"{search_root} with suffix '{suffix}'.\n"
-                f"Check --glm-folder (current: {glm_folder}) and --suffix."
-            )
-
         mask_path = find_brain_mask(
             dataset_dir, sub_label, fmriprep_folder=mask_derivatives_folder
         )
         mask = NiftiMasker(mask_img=mask_path).fit()
-        with tqdm_joblib(tqdm(desc=f"Loading sub-{sub_label}", total=len(files))):
-            res = Parallel(n_jobs=n_jobs)(
-                delayed(_load_one_file)(f, mask) for f in files
-            )
 
-        res = list(map(list, zip(*res)))
-        all_events.append(np.concatenate(res[0], axis=0))
-        all_group_labels.append(np.concatenate(res[1], axis=0))
-        all_beta_maps.append(np.concatenate(res[2], axis=0))
+        cached = None
+        if cache_dir is not None:
+            cache_path = _cache_path(cache_dir, derivatives_folder, sub_label)
+            cached = _load_cached(cache_path)
+
+        if cached is not None:
+            beta_maps, events, group_labels = cached
+        else:
+            task_glob = f"*task-{task_label}*" if task_label else "*"
+            pattern = (
+                f"sub-{sub_label}/ses-*/{glm_folder}/"
+                f"sub-{sub_label}_ses-*{task_glob}_cond-*_{suffix}.nii.gz"
+            )
+            files = sorted(str(p) for p in search_root.glob(pattern))
+            if not files:
+                raise FileNotFoundError(
+                    f"No files found for sub-{sub_label} in "
+                    f"{search_root} with suffix '{suffix}'.\n"
+                    f"Check --glm-folder (current: {glm_folder}) and --suffix."
+                )
+
+            with tqdm_joblib(tqdm(desc=f"Loading sub-{sub_label}", total=len(files))):
+                res = Parallel(n_jobs=n_jobs)(
+                    delayed(_load_one_file)(f, mask) for f in files
+                )
+
+            res = list(map(list, zip(*res)))
+            events = np.concatenate(res[0], axis=0)
+            group_labels = np.concatenate(res[1], axis=0)
+            beta_maps = np.concatenate(res[2], axis=0)
+
+            if cache_dir is not None:
+                _save_cache_atomic(cache_path, beta_maps, events, group_labels)
+
+        all_events.append(events)
+        all_group_labels.append(group_labels)
+        all_beta_maps.append(beta_maps)
 
     return (
         np.concatenate(all_beta_maps, axis=0),
         np.concatenate(all_events, axis=0),
         np.concatenate(all_group_labels, axis=0),
+        mask,
     )
 
 
@@ -315,4 +390,72 @@ def save_results(
     np.save(out / "cv_predict.npy", cv_predict)
     np.save(out / "y.npy", y)
     np.save(out / "g.npy", g)
+    return out
+
+
+def load_saved_models(decode_dir, sub_label, tag, k):
+    """Load the svm_fold_*.pkl models written by save_results(), in fold order."""
+    condition = f"test_anova_{k}"
+    out = Path(decode_dir) / f"sub-{sub_label}" / tag / condition
+    paths = sorted(
+        out.glob("svm_fold_*.pkl"), key=lambda p: int(p.stem.rsplit("_", 1)[-1])
+    )
+    return [joblib.load(p) for p in paths]
+
+
+def average_weight_maps(models, masker):
+    """Average per-class SVM weight vectors across CV folds, mapped back to brain space.
+
+    Each model is a fitted OneVsRestClassifier(Pipeline([anova, svc])) — one per
+    outer CV fold (or a GridSearchCV wrapping one, in nested mode, unwrapped via
+    `best_estimator_` same as `save_results`). SelectKBest can pick different
+    voxels per fold; a voxel not selected in a given fold contributes zero to
+    that fold's average, which is the standard way to pool weight maps across
+    folds with per-fold feature selection.
+
+    Returns dict {class_label: nibabel Nifti1Image}.
+    """
+    models = [
+        est.best_estimator_ if hasattr(est, "best_estimator_") else est
+        for est in models
+    ]
+    classes = models[0].classes_
+    n_features = len(models[0].estimators_[0].named_steps["anova"].get_support())
+
+    weight_maps = {}
+    for class_idx, label in enumerate(classes):
+        acc = np.zeros(n_features)
+        for model in models:
+            est = model.estimators_[class_idx]
+            support = est.named_steps["anova"].get_support()
+            acc[support] += est.named_steps["svc"].coef_.ravel()
+        weight_maps[label] = masker.inverse_transform(acc / len(models))
+    return weight_maps
+
+
+def save_weight_maps(output_dir, sub_label, tag, k, weight_maps):
+    """Save all classes' weight maps as one 4D NIfTI + a label sidecar.
+
+    `weight_maps` : dict {class_label: 3D Nifti1Image}, from average_weight_maps().
+    Written as `weight_maps.nii.gz` (volume order = alphabetical label order)
+    plus `weight_maps_labels.json` (that same label list) — one 4D file instead
+    of one per class is simpler to keep track of, and NiftiMasker.inverse_transform()'s
+    output only carries an sform (qform_code left at 0), which some viewers
+    ignore when overlaying onto another image (e.g. the T1w) that has both set
+    — so both are set explicitly here to the same affine.
+    """
+    condition = f"test_anova_{k}"
+    out = Path(output_dir) / f"sub-{sub_label}" / tag / condition
+    out.mkdir(parents=True, exist_ok=True)
+    for stale in out.glob("weight_map_*.nii.gz"):
+        stale.unlink()
+
+    labels = sorted(weight_maps)
+    affine = weight_maps[labels[0]].affine
+    data_4d = np.stack([weight_maps[label].get_fdata() for label in labels], axis=-1)
+    img_4d = nib.Nifti1Image(data_4d, affine)
+    img_4d.set_sform(affine, code=2)
+    img_4d.set_qform(affine, code=2)
+    img_4d.to_filename(out / "weight_maps.nii.gz")
+    (out / "weight_maps_labels.json").write_text(json.dumps(labels))
     return out

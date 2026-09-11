@@ -44,6 +44,23 @@ def find_brain_mask(dataset_path, sub_label, fmriprep_folder, space_label="T1w")
     return candidates[0]
 
 
+def find_t1w(dataset_path, sub_label, fmriprep_folder):
+    """Locate this subject's fMRIPrep-preprocessed native-space T1w image.
+
+    Used as the anatomical background for plotting — native T1w space, same as
+    `find_brain_mask`'s `space-T1w` functional data, so no resampling is needed.
+    """
+    anat_root = Path(dataset_path) / fmriprep_folder
+    candidates = sorted(
+        anat_root.glob(f"sub-{sub_label}/ses-*/anat/*_desc-preproc_T1w.nii.gz")
+    )
+    if not candidates:
+        raise FileNotFoundError(
+            f"No desc-preproc T1w image found for sub-{sub_label} under {anat_root}"
+        )
+    return candidates[0]
+
+
 def load_confounds_manual(run_file, motion_columns=None, demean=True):
     """
     Load basic motion confounds directly from the fMRIPrep-style confounds TSV,
