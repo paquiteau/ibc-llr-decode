@@ -80,7 +80,7 @@ def run_analysis(
 
         sub_long = build_long_dataframe(decode_root, strategies, [sub_label], tag, k)
         plot_subject_accuracy(
-            sub_long, rows, sub_label, sub_dir / "accuracy_boxplot.png"
+            sub_long, rows, sub_label, sub_dir / "accuracy_boxplot.pdf"
         )
 
         for strategy in strategies:
@@ -90,7 +90,7 @@ def run_analysis(
                 y_true,
                 y_pred,
                 labels,
-                sub_dir / f"confusion_matrix_{strategy}.png",
+                sub_dir / f"confusion_matrix_{strategy}.pdf",
                 title=f"sub-{sub_label} — {strategy}",
             )
 
@@ -113,7 +113,7 @@ def run_analysis(
                 plot_weight_map_comparison(
                     imgs,
                     bg_img,
-                    sub_dir / f"weight_map_{label}.png",
+                    sub_dir / f"weight_map_{label}.pdf",
                     title=f"sub-{sub_label} — {label}",
                 )
 
@@ -138,7 +138,7 @@ def run_analysis(
                 plot_norm_map_comparison(
                     paths,
                     bg_img,
-                    sub_dir / f"{kind}_map_norm.png",
+                    sub_dir / f"{kind}_map_norm.pdf",
                     title=f"sub-{sub_label} — {kind} norm",
                 )
 
@@ -157,7 +157,7 @@ def run_analysis(
         group_dir / "bootstrap_pairwise_contrasts.csv", index=False
     )
     subject_stats.to_csv(group_dir / "subject_level_pairwise_ttests.csv", index=False)
-    plot_group_comparison(df_long, contrasts, group_dir / "group_comparison.png")
+    plot_group_comparison(df_long, contrasts, group_dir / "group_comparison.pdf")
 
     return lmm_result, contrasts, bootstrap_contrasts, subject_stats
 
@@ -193,9 +193,62 @@ def run_grid_analysis(
     plot_grid_heatmap(
         df_summary,
         strategies,
-        output_dir / "heatmap_accuracy.png",
+        output_dir / "heatmap_accuracy.pdf",
         reference_strategy=reference_strategy,
     )
-    plot_grid_lines(df_summary, strategies, output_dir / "lines_accuracy_vs_k.png")
+    plot_grid_lines(df_summary, strategies, output_dir / "lines_accuracy_vs_k.pdf")
 
     return df_long, df_summary
+
+
+def run_group_comparison_by_p(
+    decode_root,
+    output_dir,
+    strategies=STRATEGIES,
+    subjects=SUBJECTS,
+    k=1500,
+    ps=(1, 2, 3, 4, 5),
+    tag_main="decode",
+    tag_sweep="cv_sweep",
+    reference_strategy="fmriprep",
+):
+    """Repeat `run_analysis`'s group-level LMM comparison figure once per `p`
+    (number of runs held out per CV fold), at a single fixed `k`.
+
+    Reuses `build_grid_long_dataframe` (which already knows p=1 comes from
+    `tag_main` and p>1 from `tag_sweep`'s `cv_sweep` runs — see its
+    docstring) restricted to one `k`, then for each `p` fits the same
+    `fit_group_lmm` + `pairwise_contrasts_from_lmm` pipeline `run_analysis`
+    uses at the default p, and draws the same `plot_group_comparison`
+    figure. Shows how the denoising-strategy gap holds up as training size
+    (runs per subject) shrinks with fewer, larger held-out folds.
+    """
+    strategies = list(strategies)
+    output_dir = Path(output_dir)
+    group_dir = output_dir / "group_by_p"
+    group_dir.mkdir(parents=True, exist_ok=True)
+
+    df_grid = build_grid_long_dataframe(
+        decode_root, strategies, subjects, [k], ps, tag_main, tag_sweep
+    )
+
+    results = {}
+    for p in ps:
+        df_p = df_grid[df_grid["p"] == p]
+        n_train_runs = int(df_p["n_train_runs"].iloc[0])
+        lmm_result = fit_group_lmm(df_p, reference=reference_strategy)
+        contrasts = pairwise_contrasts_from_lmm(
+            lmm_result, strategies, reference_strategy
+        )
+
+        (group_dir / f"lmm_summary_p{p}.txt").write_text(str(lmm_result.summary()))
+        contrasts.to_csv(group_dir / f"pairwise_contrasts_p{p}.csv", index=False)
+        plot_group_comparison(
+            df_p,
+            contrasts,
+            group_dir / f"group_comparison_p{p}_train{n_train_runs}.pdf",
+            title=f"Group comparison — p={p} runs held out ({n_train_runs} train runs)",
+        )
+        results[p] = (lmm_result, contrasts)
+
+    return results

@@ -123,6 +123,9 @@ def denoise(
     )
 
 
+DEFAULT_ANOVA_SIZE = 10_000
+
+
 @app.command()
 def decode(
     dataset_dir: ExistingDirectory,
@@ -134,7 +137,7 @@ def decode(
     glm_folder: str = "glm",
     suffix: str = "zscore",
     n_jobs: int = 1,
-    k: int = 1500,
+    k: int = DEFAULT_ANOVA_SIZE,
     nested: bool = False,
     leave_p_out: list[int] | None = None,
     tag: str = "decode",
@@ -249,7 +252,7 @@ def weight_maps(
     mask_derivatives_folder: Path,
     sub: list[str] | None = None,
     tag: str = "decode",
-    k: int = 1500,
+    k: int = DEFAULT_ANOVA_SIZE,
     cache_dir: Path | None = None,
     derivatives_folder: Path | None = None,
 ):
@@ -321,7 +324,7 @@ def analysis(
     strategy: list[str] | None = None,
     sub: list[str] | None = None,
     tag: str = "decode",
-    k: int = 1500,
+    k: int = DEFAULT_ANOVA_SIZE,
     reference_strategy: str = "fmriprep",
 ):
     """Subject-level (paired Nadeau-Bengio t-test) and group-level (LMM) stats + figures.
@@ -380,6 +383,40 @@ def grid_analysis(
         strategies=strategy or ["fmriprep", "fmriprep+denoised"],
         subjects=sub or SUBJECTS,
         ks=k or [1500, 3000, 10000, 20000, 50000],
+        ps=p or [1, 2, 3, 4, 5],
+        tag_main=tag_main,
+        tag_sweep=tag_sweep,
+        reference_strategy=reference_strategy,
+    )
+
+
+@app.command()
+def group_by_p(
+    decode_dir: ExistingDirectory,
+    output_dir: Path,
+    strategy: list[str] | None = None,
+    sub: list[str] | None = None,
+    k: int = DEFAULT_ANOVA_SIZE,
+    p: list[int] | None = None,
+    tag_main: str = "decode",
+    tag_sweep: str = "cv_sweep",
+    reference_strategy: str = "fmriprep",
+):
+    """Repeat `analysis`'s group-level comparison figure once per `p` (runs held out).
+
+    Same `decode_dir` layout as `grid_analysis` (a `--tag decode` tree for
+    p=1 plus a `--tag cv_sweep` tree at `k`). Shows how the denoising-strategy
+    gap holds up as training size shrinks, unlike `grid_analysis` which
+    surveys the whole (k, p) grid.
+    """
+    from analysis import run_group_comparison_by_p
+
+    run_group_comparison_by_p(
+        decode_dir,
+        output_dir,
+        strategies=strategy or list(STRATEGIES),
+        subjects=sub or SUBJECTS,
+        k=k,
         ps=p or [1, 2, 3, 4, 5],
         tag_main=tag_main,
         tag_sweep=tag_sweep,

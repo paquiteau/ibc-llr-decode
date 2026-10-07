@@ -144,6 +144,7 @@ def plot_weight_map_comparison(weight_map_paths, bg_img, output_path, title=None
             axes=ax,
             title=strategy,
             colorbar=True,
+            draw_cross=False,
         )
     if title:
         fig.suptitle(title)
@@ -198,6 +199,7 @@ def plot_norm_map_comparison(norm_map_paths, bg_img, output_path, title=None):
             axes=ax,
             title=strategy,
             colorbar=True,
+            draw_cross=False,
         )
     if title:
         fig.suptitle(title)
@@ -307,9 +309,10 @@ def plot_grid_lines(df_grid_summary, strategies, output_path):
     plt.close(fig)
 
 
-def plot_group_comparison(df_long, pairwise_contrasts, output_path):
+def plot_group_comparison(df_long, pairwise_contrasts, output_path, title=None):
     """Group-level box/strip: one point per subject per strategy (mean over folds),
-    subjects connected across strategies, significance bars from the fitted LMM contrasts."""
+    subjects connected across strategies, significance bars from the fitted LMM contrasts.
+    """
     strategies = list(df_long["strategy"].unique())
     means = df_long.groupby(["subject", "strategy"], as_index=False)["accuracy"].mean()
 
@@ -350,7 +353,7 @@ def plot_group_comparison(df_long, pairwise_contrasts, output_path):
     ax.set_ylim(top=max(ax.get_ylim()[1], y_top))
     ax.set_ylabel("Mean decoding accuracy (per subject)")
     ax.set_xlabel("")
-    ax.set_title("Group comparison across denoising strategies")
+    ax.set_title(title or "Group comparison across denoising strategies")
     ax.legend()
     fig.tight_layout()
     fig.savefig(output_path, dpi=150)
