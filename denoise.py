@@ -10,9 +10,11 @@ from patch_denoise.bindings.utils import DENOISER_MAP, load_as_array, save_array
 from patch_denoise.space_time.base import _patch_param
 from tqdm.auto import tqdm
 
+from glm import bids_subject_dir, find_brain_mask
+
 
 def find_bold_files(input_root, task_label, sub_labels=None, space_label=None):
-    """Walk sub-*/ses-*/func/*_bold.nii.gz under input_root, BIDS-style.
+    """Walk sub-*/[ses-*/]func/*_bold.nii.gz under input_root, BIDS-style.
 
     `space_label=None` matches raw (not spatially-normalized) BOLD files, i.e.
     files with no `space` entity at all — appropriate for denoising raw
@@ -25,7 +27,7 @@ def find_bold_files(input_root, task_label, sub_labels=None, space_label=None):
     files = []
     for sub in subs:
         for f in sorted(
-            root.glob(f"sub-{sub}/ses-*/func/*_task-{task_label}*_bold.nii.gz")
+            root.glob(f"sub-{sub}/**/func/*_task-{task_label}_*_bold.nii.gz")
         ):
             entities = parse_bids_filename(f)["entities"]
             has_space = "space" in entities
@@ -38,20 +40,13 @@ def find_bold_files(input_root, task_label, sub_labels=None, space_label=None):
 
 
 def denoised_output_path(bold_file, output_root):
-    """Mirror bold_file's sub/ses/func path under output_root, with desc set to 'denoised'."""
+    """Mirror bold_file's sub/[ses/]func path under output_root, with desc set to 'denoised'."""
     keys = parse_bids_filename(bold_file)
     keys["entities"]["desc"] = "denoised"
-    entities = keys["entities"]
     out_name = create_bids_filename(
         keys, entities_to_include=bids_entities()["raw"] + ["space", "desc"]
     )
-    return (
-        Path(output_root)
-        / f"sub-{entities['sub']}"
-        / f"ses-{entities['ses']}"
-        / "func"
-        / out_name
-    )
+    return bids_subject_dir(output_root, keys["entities"]) / "func" / out_name
 
 
 def _copy_sidecars(bold_file, output_file):
@@ -172,7 +167,6 @@ def run_denoising(
     `mask_source="auto"` computes a per-run EPI mask instead, and is the only
     valid choice when denoising raw sourcedata.
     """
-    from glm import find_brain_mask  # single source of truth for anatomical masks
 
     output_root = Path(output_root)
     output_root.mkdir(parents=True, exist_ok=True)
@@ -206,6 +200,7 @@ def run_denoising(
                 sub_label,
                 fmriprep_folder=fmriprep_root,
                 space_label=space_label or "T1w",
+                task_label=task_label,
             )
         written.append(
             denoise_one_run(

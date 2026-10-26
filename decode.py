@@ -10,7 +10,7 @@ import joblib
 import nibabel as nib
 import numpy as np
 from joblib import Parallel, delayed
-from nilearn.image import concat_imgs, math_img
+from nilearn.image import concat_imgs, math_img, resample_to_img
 from nilearn.interfaces.bids import parse_bids_filename
 from nilearn.maskers import NiftiMasker
 from sklearn.base import clone
@@ -58,8 +58,13 @@ def _load_one_file(file, mask, dtype=np.float32):
     return [cond] * beta_data.shape[0], [f"{sub}-{run}"] * beta_data.shape[0], beta_data
 
 
-def _cache_path(cache_dir, derivatives_folder, sub_label):
-    return Path(cache_dir) / Path(derivatives_folder).name / f"sub-{sub_label}.npz"
+def _cache_path(cache_dir, derivatives_folder, sub_label, glm_folder="glm"):
+    # GLM folders other than the default get their own entry, so that maps
+    # recomputed into a new folder never hit the previous maps' cache.
+    name = Path(derivatives_folder).name
+    if glm_folder != "glm":
+        name = f"{name}_{glm_folder}"
+    return Path(cache_dir) / name / f"sub-{sub_label}.npz"
 
 
 def _load_cached(cache_path):
@@ -77,7 +82,7 @@ def _load_cached(cache_path):
         return None
 
 
-def load_cached_glm_data(cache_dir, derivatives_folder, sub_label):
+def load_cached_glm_data(cache_dir, derivatives_folder, sub_label, glm_folder="glm"):
     """Return cached (X, y, g) for one subject, written by `load_glm_data`, or None.
 
     Lets a backfill (e.g. adding Haufe pattern maps to an existing `decode`
@@ -85,7 +90,9 @@ def load_cached_glm_data(cache_dir, derivatives_folder, sub_label):
     source NIfTIs, as long as that subject/strategy was previously loaded
     with a matching `cache_dir`.
     """
-    return _load_cached(_cache_path(cache_dir, derivatives_folder, sub_label))
+    return _load_cached(
+        _cache_path(cache_dir, derivatives_folder, sub_label, glm_folder)
+    )
 
 
 def _save_cache_atomic(cache_path, X, y, g):
@@ -144,13 +151,18 @@ def load_glm_data(
 
     for sub_label in sub_labels:
         mask_path = find_brain_mask(
-            dataset_dir, sub_label, fmriprep_folder=mask_derivatives_folder
+            dataset_dir,
+            sub_label,
+            fmriprep_folder=mask_derivatives_folder,
+            task_label=task_label,
         )
         mask = NiftiMasker(mask_img=mask_path).fit()
 
         cached = None
         if cache_dir is not None:
-            cache_path = _cache_path(cache_dir, derivatives_folder, sub_label)
+            cache_path = _cache_path(
+                cache_dir, derivatives_folder, sub_label, glm_folder
+            )
             cached = _load_cached(cache_path)
 
         if cached is not None:
@@ -158,8 +170,8 @@ def load_glm_data(
         else:
             task_glob = f"*task-{task_label}*" if task_label else "*"
             pattern = (
-                f"sub-{sub_label}/ses-*/{glm_folder}/"
-                f"sub-{sub_label}_ses-*{task_glob}_cond-*_{suffix}.nii.gz"
+                f"sub-{sub_label}/**/{glm_folder}/"
+                f"sub-{sub_label}_*{task_glob}_cond-*_{suffix}.nii.gz"
             )
             files = sorted(str(p) for p in search_root.glob(pattern))
             if not files:
@@ -192,6 +204,32 @@ def load_glm_data(
         np.concatenate(all_group_labels, axis=0),
         mask,
     )
+
+
+def roi_selection(masker, roi_path):
+    """Voxels of `masker`'s mask that fall in an ROI, and a masker for them.
+
+    Returns `(keep, roi_masker)`: `keep` selects the ROI columns of an array
+    produced by `masker`, `roi_masker` is fitted on brain mask ∩ ROI. Both
+    list voxels in the same (C) order, so `roi_masker` maps the ROI decoder's
+    weights back to brain space like `masker` does for whole-brain ones. The
+    ROI is resampled (nearest neighbour) to the mask's grid, in case it was
+    not drawn on it.
+    """
+    roi = resample_to_img(
+        roi_path,
+        masker.mask_img_,
+        interpolation="nearest",
+        force_resample=True,
+        copy_header=True,
+    )
+    keep = masker.transform(roi).ravel() > 0
+    if not keep.any():
+        raise ValueError(f"ROI {roi_path} has no voxel inside the brain mask")
+    roi_mask = math_img(
+        "(img > 0).astype('int8')", img=masker.inverse_transform(keep.astype("f4"))
+    )
+    return keep, NiftiMasker(mask_img=roi_mask).fit()
 
 
 def _make_pipeline(k=1000):
@@ -238,8 +276,7 @@ def run_decoding(X, y, g, n_jobs=6, k=1500, nested=False, param_grid=None):
         Only in nested mode: the winning (k, C) per outer fold — check these
         for stability across folds/runs. `None` in non-nested mode.
     fold_sizes : list[tuple[int, int]]
-        (n_train, n_test) trial counts for each outer fold — needed to
-        correctly parameterize the Nadeau-Bengio corrected t-test downstream.
+        (n_train, n_test) trial counts for each outer fold.
     """
     outer_cv = LeaveOneGroupOut()
     outer_splits = list(outer_cv.split(X, y, groups=g))
@@ -309,10 +346,14 @@ def compare_group_sizes(X, y, g, group_sizes=(1, 2, 3), k=1500, n_jobs=6):
     stable the estimated performance is depending on how many runs are left
     out at each outer fold (p=1, 2, 3...).
 
-    Returns: tuple (results_dict, predictions_dict), keyed by p.
+    Returns: tuple (results_dict, predictions_dict, fold_predictions_dict),
+    keyed by p. `predictions[p]` keeps one prediction per trial (the last fold
+    testing it); `fold_predictions[p]` is (n_folds, n_trials), "" where a
+    trial is in the training set — p > 1 tests each trial in several folds.
     """
     results = {}
     predictions = {}
+    fold_predictions = {}
     for p in group_sizes:
         cv = LeavePGroupsOut(n_groups=p)
         splits = list(cv.split(X, y, groups=g))
@@ -331,25 +372,38 @@ def compare_group_sizes(X, y, g, group_sizes=(1, 2, 3), k=1500, n_jobs=6):
         results[p] = scores
 
         cv_predict = np.empty_like(y)
-        for est, (_, test_idx) in zip(cv_results["estimator"], splits):
-            cv_predict[test_idx] = est.predict(X[test_idx])
+        folds = np.full((len(splits), len(y)), "", dtype=y.dtype)
+        for fold, (est, (_, test_idx)) in enumerate(
+            zip(cv_results["estimator"], splits)
+        ):
+            folds[fold, test_idx] = cv_predict[test_idx] = est.predict(X[test_idx])
         predictions[p] = cv_predict
+        fold_predictions[p] = folds
 
         print(
             f"p={p} ({len(splits)} folds) : {scores.mean():.3f} +/- {scores.std():.3f}"
         )
 
-    return results, predictions
+    return results, predictions, fold_predictions
 
 
 def save_group_size_comparison(
-    output_dir, sub_label, results, k, predictions=None, y=None, tag="decode"
+    output_dir,
+    sub_label,
+    results,
+    k,
+    predictions=None,
+    y=None,
+    tag="decode",
+    fold_predictions=None,
+    g=None,
 ):
     condition = f"test_anova_{k}"
     out = Path(output_dir) / f"sub-{sub_label}" / tag / condition
     out.mkdir(parents=True, exist_ok=True)
-    for stale in out.glob("scores_p*.npy"):
-        stale.unlink()
+    for pattern in ("scores_p*.npy", "cv_predict_folds_p*.npy"):
+        for stale in out.glob(pattern):
+            stale.unlink()
     summary_path = out / "summary.json"
     if summary_path.exists():
         summary_path.unlink()
@@ -366,8 +420,15 @@ def save_group_size_comparison(
         for p, preds in predictions.items():
             np.save(out / f"cv_predict_p{p}.npy", preds)
 
+    if fold_predictions is not None:
+        for p, preds in fold_predictions.items():
+            np.save(out / f"cv_predict_folds_p{p}.npy", preds)
+
     if y is not None:
         np.save(out / "y.npy", y)
+
+    if g is not None:
+        np.save(out / "g.npy", g)
 
     return out
 

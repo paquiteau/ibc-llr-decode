@@ -22,19 +22,29 @@ def snake_to_camel(text):
     return "".join(word.capitalize() for word in text.split("_"))
 
 
-def find_brain_mask(dataset_path, sub_label, fmriprep_folder, space_label="T1w"):
-    """Locate this subject's fMRIPrep brain mask.
+def bids_subject_dir(root, entities):
+    """`root/sub-XX[/ses-YY]`: the session level only exists in sessioned datasets."""
+    out = Path(root) / f"sub-{entities['sub']}"
+    return out / f"ses-{entities['ses']}" if "ses" in entities else out
+
+
+def find_brain_mask(
+    dataset_path, sub_label, fmriprep_folder, space_label="T1w", task_label=None
+):
+    """Locate this subject's fMRIPrep brain mask (the first run's, in sorted order).
 
     Brain masks are anatomical (derived from the T1w segmentation) and
     identical regardless of BOLD denoising, so they are always sourced from
     `fmriprep_folder` (the plain fMRIPrep derivatives), never from whatever
     `derivatives_folder` is being GLM'd — which may be a denoised variant
-    containing no mask files at all.
+    containing no mask files at all. `task_label` restricts the search to that
+    task's runs, for subjects scanned on several tasks.
     """
     mask_root = Path(dataset_path) / fmriprep_folder
+    task_glob = f"*_task-{task_label}_*" if task_label else "*"
     candidates = sorted(
         mask_root.glob(
-            f"sub-{sub_label}/ses-*/func/*_space-{space_label}_desc-brain_mask.nii.gz"
+            f"sub-{sub_label}/**/func/{task_glob}_space-{space_label}_desc-brain_mask.nii.gz"
         )
     )
     if not candidates:
@@ -52,7 +62,9 @@ def find_t1w(dataset_path, sub_label, fmriprep_folder):
     """
     anat_root = Path(dataset_path) / fmriprep_folder
     candidates = sorted(
-        anat_root.glob(f"sub-{sub_label}/ses-*/anat/*_desc-preproc_T1w.nii.gz")
+        p
+        for p in anat_root.glob(f"sub-{sub_label}/**/anat/*_desc-preproc_T1w.nii.gz")
+        if "_space-" not in p.name
     )
     if not candidates:
         raise FileNotFoundError(
@@ -169,11 +181,19 @@ def _compute_zscore_batch_gpu(
     safe_mean = torch.clamp(voxel_mean, min=1.0)
     gpu_Y = 100.0 * (gpu_Y / safe_mean - 1.0)
 
+    # Unit-norm columns, then diag((X^T X)^-1) from pinv(X) @ pinv(X)^T: in
+    # float32, pinv(X^T X) squares the condition number past the pinv cutoff
+    # when regressors are tiny (zero-duration events give amplitudes ~1e-3),
+    # truncating the trial's own direction and inflating its z-score. z is
+    # invariant to column scaling; betas are mapped back to the original
+    # regressor scale below.
+    col_norm = torch.linalg.vector_norm(gpu_X, dim=1, keepdim=True)
+    gpu_X = gpu_X / col_norm.clamp_min(torch.finfo(gpu_X.dtype).tiny)
     gpu_pinv = torch.linalg.pinv(gpu_X)
-    gpu_xtx_inv = torch.linalg.pinv(torch.bmm(gpu_X.transpose(1, 2), gpu_X))
 
     batch_idx = torch.arange(len(dm_stack)).cuda()
-    xtx_inv_target = gpu_xtx_inv[batch_idx, gpu_target_idx, gpu_target_idx].unsqueeze(1)
+    xtx_inv_target = (gpu_pinv[batch_idx, gpu_target_idx, :] ** 2).sum(-1, keepdim=True)
+    target_norm = col_norm[batch_idx, 0, gpu_target_idx].unsqueeze(1)
 
     n_time, n_voxels = gpu_Y.shape
     n_preds = gpu_X.shape[2]
@@ -190,7 +210,7 @@ def _compute_zscore_batch_gpu(
         se_betas = torch.sqrt(sigma_sq * xtx_inv_target)
         target_betas = beta_chunk[batch_idx, gpu_target_idx, :]
         all_z_scores.append((target_betas / se_betas).cpu())
-        all_betas.append(target_betas.cpu())
+        all_betas.append((target_betas / target_norm).cpu())
 
     return torch.cat(all_z_scores, dim=1).numpy(), torch.cat(all_betas, dim=1).numpy()
 
@@ -247,6 +267,7 @@ def make_lss_betas(
     cleanup_func: Callable[[pd.DataFrame], pd.DataFrame] | None = None,
     save_betas: bool = True,
     n_jobs: int = -1,
+    glm_folder: str = "glm",
     **kwargs,
 ):
     """Make LSS GLMs for each trial in the dataset and save the resulting beta and z-score maps to disk.
@@ -287,6 +308,8 @@ def make_lss_betas(
         -1 (default) uses all cores; a thread pool is used since gzip
         decompression/compression and disk I/O release the GIL, and passing the
         large per-run arrays between processes would itself be expensive.
+    glm_folder : str, optional
+        Name of the per-subject(-session) output folder, next to `func/`.
 
     """
 
@@ -329,6 +352,7 @@ def make_lss_betas(
             this_sub_label,
             fmriprep_folder=mask_derivatives_folder,
             space_label=space_label,
+            task_label=task_label,
         )
         masker = NiftiMasker(mask_img=mask_path).fit()
         runs = list(zip(*run_events_confounds))
@@ -359,13 +383,11 @@ def make_lss_betas(
             )
 
             keys = parse_bids_filename(run_file)
-            entities = keys["entities"]
             glm_dir = (
-                Path(dataset_path)
-                / derivatives_folder
-                / f"sub-{entities['sub']}"
-                / f"ses-{entities['ses']}"
-                / "glm"
+                bids_subject_dir(
+                    Path(dataset_path) / derivatives_folder, keys["entities"]
+                )
+                / glm_folder
             )
             os.makedirs(glm_dir, exist_ok=True)
 

@@ -1,7 +1,7 @@
 """Cyclopts CLI for generating the data and figures."""
 
 from pathlib import Path
-from typing import Annotated
+from typing import Annotated, Literal
 
 from cyclopts import App, Parameter
 from cyclopts.types import ExistingDirectory
@@ -9,15 +9,13 @@ from patch_denoise.bindings.cli import parse_dims
 from patch_denoise.bindings.utils import fast_cuda_check
 from patch_denoise.space_time.base import DenoiserName
 
-from _constants import (
-    DEFAULT_SPACE_LABEL,
-    DEFAULT_TR,
-    DEFAULT_TASK_LABEL,
-    STRATEGIES,
-    SUBJECTS,
-)
+from _constants import DATASETS, DEFAULT_SPACE_LABEL, STRATEGIES
 
 app = App()
+
+# Selects the per-dataset defaults of `_constants.DATASETS` (subjects, task,
+# TR, ...); explicitly passed options still take precedence.
+DatasetName = Literal["ibc", "motif"]
 
 PatchShapeOpt = Annotated[
     tuple[int, ...],
@@ -46,13 +44,15 @@ def glm(
     dataset_dir: ExistingDirectory,
     derivatives_folder: Path,
     mask_derivatives_folder: Path,
-    task_label: str = DEFAULT_TASK_LABEL,
+    task_label: str | None = None,
     desc: str = "preproc",
-    tr: float = DEFAULT_TR,
+    tr: float | None = None,
     space_label: str = DEFAULT_SPACE_LABEL,
     sub: list[str] | None = None,
     save_betas: Annotated[bool, Parameter(negative="--no-betas")] = True,
     n_jobs: int = -1,
+    glm_folder: str = "glm",
+    dataset: DatasetName = "ibc",
 ):
     """Compute per-trial LSS GLM beta/z-score maps for all subjects and sessions.
 
@@ -63,18 +63,20 @@ def glm(
     """
     from glm import make_lss_betas, rsvp_cleanup_events_df
 
+    ds = DATASETS[dataset]
     make_lss_betas(
         dataset_dir,
-        task_label,
+        task_label or ds.task_label,
         derivatives_folder,
         desc,
-        tr,
+        tr or ds.tr,
         mask_derivatives_folder,
         sub_labels=sub,
         space_label=space_label,
         cleanup_func=rsvp_cleanup_events_df,
         save_betas=save_betas,
         n_jobs=n_jobs,
+        glm_folder=glm_folder,
     )
 
 
@@ -82,7 +84,7 @@ def glm(
 def denoise(
     input_dir: ExistingDirectory,
     output_dir: Path,
-    task_label: str = DEFAULT_TASK_LABEL,
+    task_label: str | None = None,
     sub: list[str] | None = None,
     space_label: str | None = None,
     method: DenoiserName = DenoiserName.OPTIMAL_FRO,
@@ -94,6 +96,7 @@ def denoise(
     fmriprep_dir: Path | None = None,
     gpu: GpuFlag = fast_cuda_check(),
     overwrite: bool = False,
+    dataset: DatasetName = "ibc",
 ):
     """Denoise BOLD runs with patch-denoise, writing a mirrored derivatives tree.
 
@@ -108,7 +111,7 @@ def denoise(
     run_denoising(
         input_dir,
         output_dir,
-        task_label,
+        task_label or DATASETS[dataset].task_label,
         sub_labels=sub,
         space_label=space_label,
         method=str(method),
@@ -133,7 +136,7 @@ def decode(
     mask_derivatives_folder: Path,
     output_dir: Path,
     sub: list[str] | None = None,
-    task_label: str = DEFAULT_TASK_LABEL,
+    task_label: str | None = None,
     glm_folder: str = "glm",
     suffix: str = "zscore",
     n_jobs: int = 1,
@@ -142,6 +145,8 @@ def decode(
     leave_p_out: list[int] | None = None,
     tag: str = "decode",
     cache_dir: Path | None = None,
+    roi_mask: str | None = None,
+    dataset: DatasetName = "ibc",
 ):
     """Fit a leave-p-run-out SVM decoder on LSS beta/z-score maps, per subject.
 
@@ -161,6 +166,12 @@ def decode(
     parses the underlying NIfTI files once. Safe to share across concurrent
     `decode` invocations (e.g. a parallel job runner) for different subjects
     or k values — see `decode.load_glm_data`.
+
+    `roi_mask`, if given, restricts decoding to brain mask ∩ ROI (`{sub}` in
+    the path is replaced by the subject label); the cache still holds the
+    whole-brain arrays, so whole-brain and ROI runs share it. ANOVA still
+    selects `k` voxels inside the ROI. Write ROI runs to their own
+    `output_dir`.
     """
     from decode import (
         average_pattern_maps,
@@ -168,6 +179,7 @@ def decode(
         collapse_norm_map,
         compare_group_sizes,
         load_glm_data,
+        roi_selection,
         run_decoding,
         save_group_size_comparison,
         save_norm_map,
@@ -175,18 +187,22 @@ def decode(
         save_weight_maps,
     )
 
-    for sub_label in sub or SUBJECTS:
+    ds = DATASETS[dataset]
+    for sub_label in sub or ds.subjects:
         X, y, g, masker = load_glm_data(
             dataset_dir,
             derivatives_folder,
             mask_derivatives_folder,
-            task_label=task_label,
+            task_label=task_label or ds.task_label,
             glm_folder=glm_folder,
             suffix=suffix,
             sub_labels=[sub_label],
             n_jobs=n_jobs,
             cache_dir=cache_dir,
         )
+        if roi_mask is not None:
+            keep, masker = roi_selection(masker, roi_mask.format(sub=sub_label))
+            X = X[:, keep]
         if not leave_p_out:
             cv_results, cv_predict, best_params_per_fold, fold_sizes = run_decoding(
                 X,
@@ -232,7 +248,7 @@ def decode(
                 kind="pattern",
             )
         else:
-            results, predictions = compare_group_sizes(
+            results, predictions, fold_predictions = compare_group_sizes(
                 X,
                 y,
                 g,
@@ -241,7 +257,15 @@ def decode(
                 n_jobs=n_jobs,
             )
             save_group_size_comparison(
-                output_dir, sub_label, results, k, predictions, y, tag
+                output_dir,
+                sub_label,
+                results,
+                k,
+                predictions,
+                y,
+                tag,
+                fold_predictions,
+                g,
             )
 
 
@@ -255,6 +279,9 @@ def weight_maps(
     k: int = DEFAULT_ANOVA_SIZE,
     cache_dir: Path | None = None,
     derivatives_folder: Path | None = None,
+    roi_mask: str | None = None,
+    glm_folder: str = "glm",
+    dataset: DatasetName = "ibc",
 ):
     """Backfill/refresh weight/pattern maps for an existing `decode --output-dir` tree.
 
@@ -268,7 +295,7 @@ def weight_maps(
     (`pattern_maps.nii.gz` + `pattern_map_norm.nii.gz`) from the cached
     (X, g) arrays — still no refit, just `average_pattern_maps` on the
     already-fitted models. Without them, only the raw-weight maps are
-    (re)written.
+    (re)written. Pass the `--roi-mask` of that `decode` run, if any.
     """
     from nilearn.maskers import NiftiMasker
 
@@ -278,16 +305,24 @@ def weight_maps(
         collapse_norm_map,
         load_cached_glm_data,
         load_saved_models,
+        roi_selection,
         save_norm_map,
         save_weight_maps,
     )
     from glm import find_brain_mask
 
-    for sub_label in sub or SUBJECTS:
+    ds = DATASETS[dataset]
+    for sub_label in sub or ds.subjects:
         mask_path = find_brain_mask(
-            dataset_dir, sub_label, fmriprep_folder=mask_derivatives_folder
+            dataset_dir,
+            sub_label,
+            fmriprep_folder=mask_derivatives_folder,
+            task_label=ds.task_label,
         )
         masker = NiftiMasker(mask_img=mask_path).fit()
+        keep = None
+        if roi_mask is not None:
+            keep, masker = roi_selection(masker, roi_mask.format(sub=sub_label))
         models = load_saved_models(decode_dir, sub_label, tag, k)
         maps = average_weight_maps(models, masker)
         save_weight_maps(decode_dir, sub_label, tag, k, maps, kind="weight")
@@ -296,11 +331,15 @@ def weight_maps(
         )
 
         if cache_dir is not None and derivatives_folder is not None:
-            cached = load_cached_glm_data(cache_dir, derivatives_folder, sub_label)
+            cached = load_cached_glm_data(
+                cache_dir, derivatives_folder, sub_label, glm_folder
+            )
             if cached is None:
                 print(f"sub-{sub_label}: no cached GLM data, skipping pattern maps")
                 continue
             X, _y, g = cached
+            if keep is not None:
+                X = X[:, keep]
             pattern_maps = average_pattern_maps(models, X, g, masker)
             save_weight_maps(
                 decode_dir, sub_label, tag, k, pattern_maps, kind="pattern"
@@ -326,11 +365,22 @@ def analysis(
     tag: str = "decode",
     k: int = DEFAULT_ANOVA_SIZE,
     reference_strategy: str = "fmriprep",
+    p: list[int] | None = None,
+    tag_sweep: str = "cv_sweep",
+    dataset: DatasetName = "ibc",
 ):
-    """Subject-level (paired Nadeau-Bengio t-test) and group-level (LMM) stats + figures.
+    """Group, training-size, single-subject and per-class statistics + figures.
+
+    Every strategy is compared to `reference_strategy` on per-subject paired
+    values (exact sign-flip permutation tests, see `analysis`'s module
+    docstring and the README).
 
     `decode_dir` must contain one subdirectory per strategy, each populated by
-    a `decode --output-dir <decode_dir>/<strategy>` run (see README).
+    a `decode --output-dir <decode_dir>/<strategy>` run (see README). The
+    training-size analysis (`--p`, number of runs held out per fold, default
+    from `--dataset`) also reads the `--tag cv_sweep --leave-p-out ...` decode
+    outputs, and is skipped if they're missing. The single-subject test uses
+    the dataset's mini-blocks as units (`_constants.Dataset.block_size`).
 
     `dataset_dir`/`mask_derivatives_folder` locate each subject's T1w for the
     weight-map figures — always the plain fMRIPrep derivatives (same
@@ -338,16 +388,20 @@ def analysis(
     """
     from analysis import run_analysis
 
+    ds = DATASETS[dataset]
     run_analysis(
         decode_dir,
         output_dir,
         dataset_dir,
         mask_derivatives_folder,
         strategies=strategy or list(STRATEGIES),
-        subjects=sub or SUBJECTS,
+        subjects=sub or list(ds.subjects),
         tag=tag,
         k=k,
         reference_strategy=reference_strategy,
+        ps=p or list(ds.training_ps),
+        tag_sweep=tag_sweep,
+        block_size=ds.block_size,
     )
 
 
@@ -381,7 +435,7 @@ def grid_analysis(
         decode_dir,
         output_dir,
         strategies=strategy or ["fmriprep", "fmriprep+denoised"],
-        subjects=sub or SUBJECTS,
+        subjects=sub or list(DATASETS["ibc"].subjects),
         ks=k or [1500, 3000, 10000, 20000, 50000],
         ps=p or [1, 2, 3, 4, 5],
         tag_main=tag_main,
@@ -391,36 +445,36 @@ def grid_analysis(
 
 
 @app.command()
-def group_by_p(
-    decode_dir: ExistingDirectory,
+def tsnr(
+    denoised_dir: ExistingDirectory,
+    fmriprep_dir: ExistingDirectory,
     output_dir: Path,
-    strategy: list[str] | None = None,
     sub: list[str] | None = None,
-    k: int = DEFAULT_ANOVA_SIZE,
-    p: list[int] | None = None,
-    tag_main: str = "decode",
-    tag_sweep: str = "cv_sweep",
-    reference_strategy: str = "fmriprep",
+    task_label: str | None = None,
+    tr: float | None = None,
+    high_pass: float = 0.01,
+    n_jobs: int = 4,
+    dataset: DatasetName = "ibc",
 ):
-    """Repeat `analysis`'s group-level comparison figure once per `p` (runs held out).
+    """tSNR of each denoised run and of its fMRIPrep source, same definition for every dataset.
 
-    Same `decode_dir` layout as `grid_analysis` (a `--tag decode` tree for
-    p=1 plus a `--tag cv_sweep` tree at `k`). Shows how the denoising-strategy
-    gap holds up as training size shrinks, unlike `grid_analysis` which
-    surveys the whole (k, p) grid.
+    `denoised_dir` mirrors `fmriprep_dir` (output of `denoise`). tSNR =
+    mean / std over time, the std taken after removing a cosine drift basis
+    at `high_pass` Hz (default: the LSS GLM's 0.01 Hz; 0 keeps the raw std).
+    Voxels left at zero by denoising are excluded from both versions.
     """
-    from analysis import run_group_comparison_by_p
+    from tsnr import run_tsnr
 
-    run_group_comparison_by_p(
-        decode_dir,
+    ds = DATASETS[dataset]
+    run_tsnr(
+        denoised_dir,
+        fmriprep_dir,
         output_dir,
-        strategies=strategy or list(STRATEGIES),
-        subjects=sub or SUBJECTS,
-        k=k,
-        ps=p or [1, 2, 3, 4, 5],
-        tag_main=tag_main,
-        tag_sweep=tag_sweep,
-        reference_strategy=reference_strategy,
+        task_label or ds.task_label,
+        tr or ds.tr,
+        sub_labels=sub,
+        high_pass=high_pass or None,
+        n_jobs=n_jobs,
     )
 
 
